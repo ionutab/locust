@@ -107,19 +107,19 @@ class MqttClient(mqtt.Client):
 
         # See https://github.com/eclipse/paho.mqtt.python/issues/237
         if not client_id:
-            self.client_id = f"locust-{_generate_random_id(16)}"
-        else:
-            self.client_id = client_id
+            client_id = f"locust-{_generate_random_id(16)}"
 
-        super().__init__(*args, client_id=self.client_id, protocol=protocol, **kwargs)
+        super().__init__(*args, **kwargs)
         self.environment = environment
+        # we need to set client_id in case the broker assigns one to us
+        self.client_id = client_id
 
-        self.on_publish = self._on_publish_cb
-        self.on_subscribe = self._on_subscribe_cb
+        self.on_publish = self._on_publish_cb  # type: ignore[assignment]
+        self.on_subscribe = self._on_subscribe_cb  # type: ignore[assignment]
 
         if protocol == mqtt.MQTTv5:
-            self.on_disconnect = self._on_disconnect_cb_v5
-            self.on_connect = self._on_connect_cb_v5
+            self.on_disconnect = self._on_disconnect_cb_v5  # type: ignore[assignment]
+            self.on_connect = self._on_connect_cb_v5  # type: ignore[assignment]
         else:
             self.on_disconnect = self._on_disconnect_cb_v3x
             self.on_connect = self._on_connect_cb_v3x
@@ -220,7 +220,7 @@ class MqttClient(mqtt.Client):
         self,
         client: mqtt.Client,
         userdata: typing.Any,
-        rc: int,
+        rc: int | ReasonCode,
     ):
         if rc != 0:
             self.environment.events.request.fire(
@@ -258,6 +258,7 @@ class MqttClient(mqtt.Client):
         self,
         client: mqtt.Client,
         userdata: typing.Any,
+        disconnect_flags: mqtt.DisconnectFlags,
         reasoncode: ReasonCode,
         properties: Properties,
     ):
@@ -268,7 +269,7 @@ class MqttClient(mqtt.Client):
         client: mqtt.Client,
         userdata: typing.Any,
         flags: dict[str, int],
-        rc: int,
+        rc: int | ReasonCode,
     ):
         if rc != 0:
             self.environment.events.request.fire(
@@ -276,7 +277,7 @@ class MqttClient(mqtt.Client):
                 name="connect",
                 response_time=0,
                 response_length=0,
-                exception=rc,
+                exception=Exception(str(rc)),
                 context={
                     "client_id": self.client_id,
                 },
@@ -307,16 +308,16 @@ class MqttClient(mqtt.Client):
         self,
         client: mqtt.Client,
         userdata: typing.Any,
-        flags: dict[str, int],
+        connect_flags: mqtt.ConnectFlags,
         reasoncode: ReasonCode,
         properties: Properties,
     ):
-        return self._on_connect_cb(client, userdata, flags, reasoncode)
+        return self._on_connect_cb(client, userdata, {}, reasoncode)
 
     def publish(
         self,
         topic: str,
-        payload: bytes | None = None,
+        payload: mqtt.PayloadType | None = None,
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
@@ -330,7 +331,7 @@ class MqttClient(mqtt.Client):
             qos=qos,
             topic=topic,
             start_time=time.time(),
-            payload_size=len(payload) if payload else 0,
+            payload_size=len(payload) if payload and not isinstance(payload, (int, float)) else 0,
         )
 
         publish_info = super().publish(topic, payload=payload, qos=qos, retain=retain, properties=properties)
@@ -355,23 +356,26 @@ class MqttClient(mqtt.Client):
 
     def subscribe(
         self,
-        topic: str,
+        topic: str | tuple[str, int] | tuple[str, SubscribeOptions] | list[tuple[str, int]] | list[tuple[str, SubscribeOptions]],
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
-    ) -> tuple[int, int | None]:
+    ) -> tuple[mqtt.MQTTErrorCode, int | None]:
         """Subscribe to a given topic.
 
         This method wraps the underlying paho-mqtt client's method in order to
         set up & fire Locust events.
         """
-        request_context = SubscribeContext(
-            qos=qos,
-            topic=topic,
-            start_time=time.time(),
-        )
+        start_time = time.time()
+        if isinstance(topic, str):
+            request_context = SubscribeContext(qos=qos, topic=topic, start_time=start_time)
+        else:
+            # paho-mqtt supports subscriptions to multiple topics at once, but
+            # we have no way of distinguishing between them at the moment.
+            # So, we'll just use the first topic for now.
+            request_context = SubscribeContext(qos=qos, topic=topic[0][0], start_time=start_time)
 
-        result, mid = super().subscribe(topic=topic, qos=qos)
+        result, mid = super().subscribe(topic, qos, options, properties)  # type: ignore[arg-type]
 
         if result != mqtt.MQTT_ERR_SUCCESS:
             self.environment.events.request.fire(
@@ -386,7 +390,21 @@ class MqttClient(mqtt.Client):
                 },
             )
         else:
-            self._subscribe_requests[mid] = request_context
+            if mid is None:
+                # QoS 0 subscriptions do not have a mid, so we'll just fire a success event immediately
+                self.environment.events.request.fire(
+                    request_type=REQUEST_TYPE,
+                    name=self._generate_event_name("subscribe", request_context.qos, request_context.topic),
+                    response_time=(time.time() - request_context.start_time) * 1000,
+                    response_length=0,
+                    exception=None,
+                    context={
+                        "client_id": self.client_id,
+                        **request_context._asdict(),
+                    },
+                )
+            else:
+                self._subscribe_requests[mid] = request_context
 
         return result, mid
 
@@ -427,7 +445,7 @@ class MqttUser(User):
             )
 
         self.client.connect_async(
-            host=self.host,
+            host=self.host, # type: ignore
             port=self.port,
         )
         self.client.loop_start()
