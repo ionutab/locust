@@ -66,12 +66,7 @@ class PublishedMessageContext(typing.NamedTuple):
     payload_size: int
 
 
-class SubscribeContext(typing.NamedTuple):
-    """Stores metadata about outgoing published messages."""
 
-    qos: int
-    topic: str
-    start_time: float
 
 
 class MqttClient(mqtt.Client):
@@ -115,17 +110,18 @@ class MqttClient(mqtt.Client):
         self.client_id = client_id
 
         self.on_publish = self._on_publish_cb  # type: ignore[assignment]
-        self.on_subscribe = self._on_subscribe_cb  # type: ignore[assignment]
 
         if protocol == mqtt.MQTTv5:
-            self.on_disconnect = self._on_disconnect_cb_v5  # type: ignore[assignment]
-            self.on_connect = self._on_connect_cb_v5  # type: ignore[assignment]
+            self.on_disconnect = self._on_disconnect_cb_v5 
+            self.on_connect = self._on_connect_cb_v5 
+            self.on_subscribe = self._on_subscribe_cb_v5 
         else:
-            self.on_disconnect = self._on_disconnect_cb_v3x
-            self.on_connect = self._on_connect_cb_v3x
+            self.on_disconnect = self._on_disconnect_cb_v3x # type: ignore[assignment]
+            self.on_connect = self._on_connect_cb_v3x # type: ignore[assignment]
+            self.on_subscribe = self._on_subscribe_cb_v3x # type: ignore[assignment]
 
         self._publish_requests: dict[int, PublishedMessageContext] = {}
-        self._subscribe_requests: dict[int, SubscribeContext] = {}
+        self._subscribe_requests: dict[int, tuple[int, str, float]] = {}
 
     def _generate_event_name(self, event_type: str, qos: int, topic: str):
         return _generate_mqtt_event_name(event_type, qos, topic)
@@ -166,7 +162,7 @@ class MqttClient(mqtt.Client):
                 },
             )
 
-    def _on_subscribe_cb(
+    def _on_subscribe_cb_v3x(
         self,
         client: mqtt.Client,
         userdata: typing.Any,
@@ -175,7 +171,7 @@ class MqttClient(mqtt.Client):
     ):
         cb_time = time.time()
         try:
-            request_context = self._subscribe_requests.pop(mid)
+            qos, topic, start_time = self._subscribe_requests.pop(mid)
         except KeyError:
             # we shouldn't hit this block of code
             self.environment.events.request.fire(
@@ -193,28 +189,44 @@ class MqttClient(mqtt.Client):
             if SUBACK_FAILURE in granted_qos:
                 self.environment.events.request.fire(
                     request_type=REQUEST_TYPE,
-                    name=self._generate_event_name("subscribe", request_context.qos, request_context.topic),
-                    response_time=(cb_time - request_context.start_time) * 1000,
+                    name=self._generate_event_name("subscribe", qos, topic),
+                    response_time=(cb_time - start_time) * 1000,
                     response_length=0,
                     exception=AssertionError(f"Broker returned an error response during subscription: {granted_qos}"),
                     context={
                         "client_id": self.client_id,
-                        **request_context._asdict(),
+                        "qos": qos,
+                        "topic": topic,
+                        "start_time": start_time,
                     },
                 )
             else:
                 # fire successful subscribe event
                 self.environment.events.request.fire(
                     request_type=REQUEST_TYPE,
-                    name=self._generate_event_name("subscribe", request_context.qos, request_context.topic),
-                    response_time=(cb_time - request_context.start_time) * 1000,
+                    name=self._generate_event_name("subscribe", qos, topic),
+                    response_time=(cb_time - start_time) * 1000,
                     response_length=0,
                     exception=None,
                     context={
                         "client_id": self.client_id,
-                        **request_context._asdict(),
+                        "qos": qos,
+                        "topic": topic,
+                        "start_time": start_time,
                     },
                 )
+
+    # pylint: disable=unused-argument
+    def _on_subscribe_cb_v5(
+        self,
+        client: mqtt.Client,
+        userdata: typing.Any,
+        mid: int,
+        reason_codes: list[ReasonCode],
+        properties: Properties,
+    ):
+        granted_qos = [rc.value for rc in reason_codes]
+        return self._on_subscribe_cb_v3x(client, userdata, mid, granted_qos)
 
     def _on_disconnect_cb(
         self,
@@ -367,26 +379,22 @@ class MqttClient(mqtt.Client):
         set up & fire Locust events.
         """
         start_time = time.time()
-        if isinstance(topic, str):
-            request_context = SubscribeContext(qos=qos, topic=topic, start_time=start_time)
-        else:
-            # paho-mqtt supports subscriptions to multiple topics at once, but
-            # we have no way of distinguishing between them at the moment.
-            # So, we'll just use the first topic for now.
-            request_context = SubscribeContext(qos=qos, topic=topic[0][0], start_time=start_time)
+        subscribe_topic = topic if isinstance(topic, str) else topic[0][0]
 
         result, mid = super().subscribe(topic, qos, options, properties)  # type: ignore[arg-type]
 
         if result != mqtt.MQTT_ERR_SUCCESS:
             self.environment.events.request.fire(
                 request_type=REQUEST_TYPE,
-                name=self._generate_event_name("subscribe", request_context.qos, request_context.topic),
+                name=self._generate_event_name("subscribe", qos, subscribe_topic),
                 response_time=0,
                 response_length=0,
                 exception=result,
                 context={
                     "client_id": self.client_id,
-                    **request_context._asdict(),
+                    "qos": qos,
+                    "topic": subscribe_topic,
+                    "start_time": start_time,
                 },
             )
         else:
@@ -394,17 +402,19 @@ class MqttClient(mqtt.Client):
                 # QoS 0 subscriptions do not have a mid, so we'll just fire a success event immediately
                 self.environment.events.request.fire(
                     request_type=REQUEST_TYPE,
-                    name=self._generate_event_name("subscribe", request_context.qos, request_context.topic),
-                    response_time=(time.time() - request_context.start_time) * 1000,
+                    name=self._generate_event_name("subscribe", qos, subscribe_topic),
+                    response_time=(time.time() - start_time) * 1000,
                     response_length=0,
                     exception=None,
                     context={
                         "client_id": self.client_id,
-                        **request_context._asdict(),
+                        "qos": qos,
+                        "topic": subscribe_topic,
+                        "start_time": start_time,
                     },
                 )
             else:
-                self._subscribe_requests[mid] = request_context
+                self._subscribe_requests[mid] = (qos, subscribe_topic, start_time)
 
         return result, mid
 
