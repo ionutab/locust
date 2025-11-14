@@ -1,13 +1,13 @@
 from __future__ import annotations
-from contextlib import suppress
-import selectors
 
 from locust import User
 from locust.env import Environment
 
 import random
+import selectors
 import time
 import typing
+from contextlib import suppress
 
 import paho.mqtt.client as mqtt
 
@@ -74,7 +74,7 @@ class MqttClient(mqtt.Client):
         *args,
         environment: Environment,
         client_id: str | None = None,
-        protocol: MQTTProtocolVersion = mqtt.MQTTv311,
+        protocol: MQTTProtocolVersion = mqtt.MQTTv5,
         **kwargs,
     ):
         """Initializes a paho.mqtt.Client for use in Locust swarms.
@@ -423,8 +423,10 @@ class MqttClient(mqtt.Client):
 
 
 class ExperimentalMqttClient(MqttClient):
+    def __init__(self, *args, environment, client_id=None, protocol=mqtt.MQTTv311, **kwargs):
+        super().__init__(*args, environment=environment, client_id=client_id, protocol=protocol, **kwargs)
 
-    def _loop(self, timeout: float = 1.0) -> int:
+    def _loop(self, timeout: float = 1.0) -> mqtt.MQTTErrorCode:
         if timeout < 0.0:
             raise ValueError("Invalid timeout.")
 
@@ -440,7 +442,7 @@ class ExperimentalMqttClient(MqttClient):
         # used to check if there are any bytes left in the (SSL) socket
         pending_bytes = 0
         if hasattr(self._sock, "pending"):
-            pending_bytes = self._sock.pending()
+            pending_bytes = self._sock.pending()  # type: ignore
 
         # if bytes are pending do not wait in select
         if pending_bytes > 0:
@@ -448,24 +450,24 @@ class ExperimentalMqttClient(MqttClient):
 
         try:
             if self._sockpairR is None:
-                sel.register(self._sock, eventmask)
+                sel.register(self._sock, eventmask)  # type: ignore
             else:
-                sel.register(self._sock, eventmask)
+                sel.register(self._sock, eventmask)  # type: ignore
                 sel.register(self._sockpairR, selectors.EVENT_READ)
 
             events = sel.select(timeout)
 
         except TypeError:
             # Socket isn't correct type, in likelihood connection is lost
-            return int(MQTT_ERR_CONN_LOST)
+            return mqtt.MQTT_ERR_CONN_LOST
         except ValueError:
             # Can occur if we just reconnected but rlist/wlist contain a -1 for
             # some reason.
-            return int(MQTT_ERR_CONN_LOST)
+            return mqtt.MQTT_ERR_CONN_LOST
         except Exception:
             # Note that KeyboardInterrupt, etc. can still terminate since they
             # are not derived from Exception
-            return int(MQTT_ERR_UNKNOWN)
+            return mqtt.MQTT_ERR_UNKNOWN
 
         socklist: list[list] = [[], []]
 
@@ -479,7 +481,7 @@ class ExperimentalMqttClient(MqttClient):
         if self._sock in socklist[0] or pending_bytes > 0:
             rc = self.loop_read()
             if rc or self._sock is None:
-                return int(rc)
+                return rc
 
         if self._sockpairR and self._sockpairR in socklist[0]:
             # Stimulate output write even though we didn't ask for it, because
@@ -494,11 +496,12 @@ class ExperimentalMqttClient(MqttClient):
         if self._sock in socklist[1]:
             rc = self.loop_write()
             if rc or self._sock is None:
-                return int(rc)
+                return rc
 
         sel.close()
 
-        return int(self.loop_misc())
+        return self.loop_misc()
+
 
 class MqttUser(User):
     abstract = True
@@ -541,9 +544,10 @@ class MqttUser(User):
         )
         self.client.loop_start()
 
+
 class ExperimentalMqttUser(MqttUser):
     abstract = True
-    
+
     client_cls: type[MqttClient] = ExperimentalMqttClient
 
     def __init__(self, environment: Environment):
